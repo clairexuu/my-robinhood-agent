@@ -1,87 +1,133 @@
-# 08. Robinhood MCP 与真实交易安全门
+# 08. Robinhood Safety Gate
 
-## 目标
+## 目的
 
-安全接入 Robinhood MCP，用于账户读取、交易可行性检查、订单预检，以及人工确认后的真实下单。
+Robinhood safety gate 是 live order 的本地前置检查。当前实现只做 preview 和 confirmation text 校验，不会调用 Robinhood MCP，也不会真实下单。
 
-## 范围
+代码位置：
 
-包含：
+- `src/robinhood_agent/agent/robinhood_gate.py`
+- `src/robinhood_agent/config.py`
+- `src/robinhood_agent/cli.py`
+- `tests/test_robinhood_gate.py`
 
-- 指定账户校验
-- 账户、持仓、购买力读取
-- 可交易性检查
-- 订单预检
-- 人工确认 gate
+## 当前能力
 
-不包含：
+`preview_live_order(config, paper_preview, account_number)` 把本地 `TradePreview` 转成 `LiveOrderPreview`。
 
-- 自动真实交易
-- 用 Robinhood 做主要研究数据源
-- 绕过人工确认的下单
+`validate_live_order_confirmation(preview, confirmation_text)` 校验用户确认文本是否包含必要信息。
 
-## 关键设计
-
-默认禁止真实下单。
-
-真实交易路径必须和研究 / paper trading 路径分离：
+`format_live_order_preview()` 输出检查结果，并固定提示：
 
 ```text
-research update
-  -> paper intent
-  -> trade preview
-  -> human confirmation
-  -> Robinhood order placement
+No live Robinhood order was placed.
 ```
 
-任何 live order 都必须满足：
+## 配置
 
-- account number 匹配配置
-- 用户显式确认
-- 订单预检成功
-- 风控规则通过
+`RobinhoodGateConfig`：
 
-## Milestones
+- `allowed_account_number: Optional[str] = None`
+- `live_trading_enabled: bool = False`
 
-### M1: 配置账户安全边界
+来源：
 
-读取允许账户配置和 live trading 开关。
+- `ROBINHOOD_ALLOWED_ACCOUNT_NUMBER`
+- `ROBINHOOD_LIVE_TRADING_ENABLED`
 
-验收标准：
+默认 live trading disabled。
 
-- 默认 live trading 为 disabled。
-- account number 不匹配时禁止继续。
+## Preview Gate 规则
 
-### M2: 实现账户读取
+`preview_live_order()` 依次检查：
 
-通过 Robinhood MCP 读取账户、持仓和购买力。
+1. `live_trading_enabled` 必须为 true。
+2. `allowed_account_number` 必须已配置。
+3. 请求传入的 account number 必须匹配 allowed account。
+4. paper preview 必须 `allowed=True`。
+5. paper preview side 不能是 `hold`。
 
-验收标准：
+任一失败都会返回 `allowed=False` 和明确 reason。
 
-- 能返回账户摘要。
-- 错误信息不泄漏敏感 token。
+全部通过时，返回：
 
-### M3: 实现 trade preview
+```text
+allowed=True
+reason="live order preview passed local safety gate; human confirmation still required"
+```
 
-把研究意图转成订单预览，不真实下单。
+这仍然不是下单许可，只表示本地前置检查通过。
 
-验收标准：
+## Human Confirmation
 
-- 检查购买力和可交易性。
-- 输出预估订单详情。
-- 明确提示需要人工确认。
+`validate_live_order_confirmation()` 只在 preview 已 allowed 时继续检查。
 
-### M4: 实现人工确认后的 live order
+确认文本必须包含：
 
-只在显式确认后调用真实下单。
+- ticker
+- side
+- account number
+- rounded notional 或 rounded quantity
 
-验收标准：
+缺字段时返回新的 `LiveOrderPreview(allowed=False)`，reason 会列出缺失片段。
 
-- 未确认时不会调用下单工具。
-- 确认内容包含 ticker、方向、金额或数量、账户。
-- 所有真实下单都有审计记录。
+通过时 reason 为：
 
-## 待确认
+```text
+human confirmation accepted; live placement is not implemented in this MVP
+```
 
-- 人工确认的交互形式：CLI 输入、API confirmation token，还是 UI 按钮。
-- 第一版是否完全禁用 live order，只保留 preview。
+## CLI live-preview
+
+CLI 命令：
+
+```bash
+PYTHONPATH=src python3 -m robinhood_agent.cli --db var/agent.db live-preview NVDA buy --amount 1000 --account-number RH123
+```
+
+流程：
+
+1. 构造 market data provider。
+2. 基于输入生成本地 paper trade preview。
+3. 构造 `RobinhoodGateConfig`。
+4. 调 `preview_live_order()`。
+5. 如果提供 `--confirmation`，再调 `validate_live_order_confirmation()`。
+6. 打印 live order safety preview。
+
+即使 confirmation 通过，当前代码也不会继续调用任何下单 API。
+
+## 与 Paper Ledger 的关系
+
+live preview 依赖 `TradePreview`，因为真实交易前应先经过同一套本地金额、数量、现金和持仓检查。
+
+但两者仍是不同边界：
+
+- paper ledger 可以记录本地模拟订单。
+- Robinhood safety gate 只做 live order 预检状态。
+- 当前没有从 `LiveOrderPreview` 到真实 broker order 的实现。
+
+## 未实现项
+
+当前没有：
+
+- Robinhood MCP client。
+- 账户读取。
+- 持仓或购买力从 Robinhood 同步。
+- order preview API 调用。
+- live order placement。
+- live order 审计表。
+
+README 中保留 Robinhood MCP 链接作为后续接入参考，但代码没有 wiring。
+
+## 扩展前置要求
+
+实现真实交易前，应先补齐：
+
+- 明确的 MCP client 接口和 fake client。
+- 账户读取与 allowed account 二次校验。
+- Robinhood order preview 结果模型。
+- 人工确认 token 或强格式确认文本。
+- live order 审计表。
+- 单元测试覆盖所有拒绝路径。
+
+任何真实下单调用必须在所有 gate 通过后单独实现，不能放进 formatter 或 router。

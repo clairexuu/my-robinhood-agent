@@ -1,72 +1,125 @@
 # 06. Paper Ledger 与表现评估
 
-## 目标
+## 目的
 
-维护本地模拟交易账本，并评估研究观点的后续表现。
+Paper ledger 是本地模拟交易账本，用于把研究目标仓位转成可审计的模拟订单和表现快照。它不依赖 Robinhood，也不会产生真实订单。
 
-## 范围
+代码位置：
 
-包含：
+- `src/robinhood_agent/agent/paper_ledger.py`
+- `src/robinhood_agent/agent/performance.py`
+- `src/robinhood_agent/storage/repositories.py`
+- `tests/test_paper_ledger.py`
+- `tests/test_performance.py`
 
-- 虚拟现金
-- 虚拟持仓
-- 模拟订单
-- 成本和 PnL
-- benchmark 对比
-- 最大回撤和基础风险指标
+## TradePreview
 
-不包含：
+`TradePreview` 是所有 paper 交易和 live safety preview 的前置对象：
 
-- 真实下单
-- 券商账户对账
-- 复杂回测引擎
+- `ticker`
+- `side`
+- `price`
+- `quantity`
+- `notional`
+- `fee`
+- `estimated_cash_after`
+- `estimated_quantity_after`
+- `allowed`
+- `reason`
 
-## 关键设计
+formatter 会明确输出：
 
-Paper ledger 是本项目自己维护的本地账本，不依赖 Robinhood paper trading。
+```text
+This is a local paper trade preview, not a live Robinhood order.
+```
 
-模拟订单来自 research update 或用户明确要求，但执行仍是本地记录。
+## 手动 Paper Trade
 
-## Milestones
+`trade_preview()`：
 
-### M1: 定义 ledger models
+1. 读取 watch profile。
+2. 通过 market data provider 获取最新价格。
+3. 要求 `amount` 或 `quantity` 至少一个。
+4. 根据 side 估算交易后现金和持仓。
+5. 校验 buy 是否现金足够、sell 是否持仓足够。
 
-定义 `PaperOrder`、`PaperPosition`、`LedgerSnapshot`。
+`execute_paper_trade()`：
 
-验收标准：
+1. 要求 preview `allowed=True`。
+2. 拒绝执行 `hold`。
+3. 创建 `PaperOrder`。
+4. 调用 `repository.record_paper_order()`。
+5. 返回 order、position 和 ledger summary。
 
-- 支持 buy / sell / hold。
-- 记录数量、价格、时间、费用字段。
+## Research Paper Intent
 
-### M2: 实现模拟成交
+`build_paper_intent()` 把 thesis 的 `target_position_pct` 转成 rebalance preview。
 
-用市场价格生成本地模拟成交记录。
+计算：
 
-验收标准：
+```text
+current_position_value = current_quantity * latest_price
+total_equity = cash + current_position_value
+target_position_value = total_equity * target_position_pct
+delta_value = target_position_value - current_position_value
+```
 
-- buy 后现金减少、持仓增加。
-- sell 后现金增加、持仓减少。
-- 不允许卖出超过持仓。
+行为：
 
-### M3: 实现表现评估
+- `abs(delta_value) < min_trade_notional`: 返回 `hold`。
+- `delta_value > 0`: 返回 buy preview。
+- `delta_value < 0`: 返回 sell preview。
 
-计算绝对收益、相对 benchmark 收益、最大回撤和持仓周期。
+默认 `min_trade_notional = 1.0`。
 
-验收标准：
+`full_research()` 只生成 paper intent，不自动执行。`apply_latest_paper_intent()` 才会执行最新 research update 对应的本地模拟订单。
 
-- 给定历史价格 fixture，计算结果稳定。
-- 支持 1D / 1W / 1M 观察窗口。
+## 账本持久化
 
-### M4: 接入 research output
+`paper_orders` 保存订单历史。`paper_positions` 保存当前持仓。
 
-把研究观点和模拟订单关联起来。
+`AgentRepository.record_paper_order()` 负责：
 
-验收标准：
+- buy 后更新 quantity 和加权 average cost。
+- sell 后减少 quantity，保留 average cost；清仓归零。
+- 拒绝卖出超过持仓。
 
-- 每条模拟订单能追溯到 research update。
-- 表现快照能显示建议后的后续表现。
+cash 不单独存表，而是由 `get_ledger_summary()` 根据初始现金和订单历史重算。默认初始现金是 `100_000.0`。
 
-## 待确认
+## 表现评估
 
-- 初始虚拟现金金额，默认建议 `$100,000`。
-- 是否允许 fractional shares，默认允许。
+`evaluate_performance(repository, ticker, window, price_provider)`：
+
+1. 读取 watch profile 和当前 position quantity。
+2. 获取 ticker 和 benchmark 的历史价格。
+3. 要求每组至少两个 price point。
+4. 计算 absolute return。
+5. 计算 benchmark return。
+6. 计算 max drawdown。
+7. 保存 `PerformanceSnapshot`。
+
+窗口由 CLI 限制为：
+
+- `1D`
+- `1W`
+- `1M`
+
+`CsvPriceProvider` 和 `PolygonProvider` 都实现 `fetch_price_history()`。
+
+## 指标定义
+
+```text
+absolute_return = end_price / start_price - 1
+benchmark_return = benchmark_end / benchmark_start - 1
+relative_return = absolute_return - benchmark_return
+max_drawdown = min(point.close / running_peak - 1)
+```
+
+当前 performance 是标的价格表现，不是账户级组合收益。它会展示当前 position quantity，但 return 本身没有按仓位加权。
+
+## 边界
+
+- Paper order 永远不代表真实 Robinhood order。
+- `hold` preview 不能执行成订单。
+- 当前没有复杂回测、税费模型、滑点模型或多资产组合净值。
+- 若未来加入真实交易，对账也应作为独立模块，不应复用 paper ledger 表作为券商账本。

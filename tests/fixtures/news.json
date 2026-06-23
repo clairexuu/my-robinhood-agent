@@ -1,0 +1,38 @@
+[
+  {
+    "id": "json-news-nvda-low",
+    "ticker": "NVDA",
+    "source": "json_fixture",
+    "external_id": "nvda-low",
+    "event_type": "news",
+    "severity": "low",
+    "title": "NVDA publishes routine developer update",
+    "summary": "The company published a routine developer note with no material thesis impact.",
+    "occurred_at": "2026-06-18T14:30:00+00:00",
+    "raw_url": "https://example.test/nvda-low"
+  },
+  {
+    "id": "json-news-nvda-critical",
+    "ticker": "NVDA",
+    "source": "json_fixture",
+    "external_id": "nvda-critical",
+    "event_type": "news",
+    "severity": "critical",
+    "title": "NVDA announces major data center supply update",
+    "summary": "Management announced a material update to data center supply availability.",
+    "occurred_at": "2026-06-19T14:30:00+00:00",
+    "raw_url": "https://example.test/nvda-critical"
+  },
+  {
+    "id": "json-news-msft-high",
+    "ticker": "MSFT",
+    "source": "json_fixture",
+    "external_id": "msft-high",
+    "event_type": "news",
+    "severity": "high",
+    "title": "MSFT unrelated fixture event",
+    "summary": "This event should be filtered out when fetching NVDA news.",
+    "occurred_at": "2026-06-19T15:00:00+00:00",
+    "raw_url": "https://example.test/msft-high"
+  }
+]

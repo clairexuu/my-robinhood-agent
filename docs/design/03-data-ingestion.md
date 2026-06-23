@@ -1,75 +1,142 @@
 # 03. 数据源与事件摄取
 
-## 目标
+## 目的
 
-从外部数据源收集市场、新闻、公告和日历信息，并统一成标准事件。
+Provider 层把外部数据源和本地 fixture 统一成 agent 可消费的类型。Provider 不更新 thesis、不写 ledger、不直接持久化；workflow 决定如何使用 provider 输出。
 
-## 范围
+代码位置：
 
-包含：
+- `src/robinhood_agent/providers/base.py`
+- `src/robinhood_agent/providers/polygon.py`
+- `src/robinhood_agent/providers/sec_edgar.py`
+- `src/robinhood_agent/providers/fmp.py`
+- `src/robinhood_agent/providers/composite.py`
+- `src/robinhood_agent/providers/csv_provider.py`
+- `src/robinhood_agent/providers/json_provider.py`
+- `src/robinhood_agent/providers/fake.py`
 
-- 市场数据 provider
-- 新闻 / 公告 provider
-- SEC filing provider
-- earnings calendar provider
-- 事件归一化和去重
+## Provider Protocols
 
-不包含：
+`base.py` 定义协议和共享数据类型：
 
-- LLM 分析
-- paper ledger 记账
-- Robinhood 账户数据
+- `MarketDataProvider.fetch_market_data(ticker, benchmark) -> MarketData`
+- `NewsProvider.fetch_news(ticker) -> list[ResearchEvent]`
+- `FilingProvider.fetch_filings(ticker) -> list[ResearchEvent]`
+- `EarningsCalendarProvider.fetch_earnings_calendar(ticker) -> list[ResearchEvent]`
+- `TranscriptProvider.fetch_transcripts(ticker) -> list[ResearchEvent]`
+- `HistoricalPriceProvider.fetch_price_history(ticker, window) -> list[PricePoint]`
 
-## 关键设计
+这些是 structural protocols；真实 provider 和 fake provider 只要实现同名方法即可注入 agent workflow。
 
-Robinhood MCP 不作为主要研究数据源。
+## MarketData
 
-第一版只需要接入：
+`MarketData` 是行情快照：
 
-- 一个市场数据源
-- 一个新闻或公告来源
+- `ticker`
+- `benchmark`
+- `latest_price`
+- `previous_close`
+- `benchmark_latest_price`
+- `benchmark_previous_close`
+- `volume`
+- `average_volume`
 
-Provider 输出原始数据，normalizer 负责转成 `ResearchEvent`。
+计算属性：
 
-## Milestones
+- `price_change_pct`
+- `benchmark_change_pct`
+- `relative_change_pct`
 
-### M1: 定义 provider interface
+`full_research.compute_signals()` 进一步派生：
 
-定义统一接口，例如 `fetch_market_data`、`fetch_news`、`fetch_filings`。
+- `price_change_pct`
+- `benchmark_change_pct`
+- `relative_change_pct`
+- `volume_ratio`
 
-验收标准：
+## 真实数据源
 
-- 可以用 fake provider 跑测试。
-- provider 返回值不依赖 LangGraph。
+### PolygonProvider
 
-### M2: 实现市场数据 provider
+承担三类职责：
 
-获取目标 ticker 和 benchmark 的价格、成交量、基础行情。
+- 市场行情：snapshot + daily aggregate bars。
+- 新闻：`/v2/reference/news`。
+- earnings calendar：`/vX/reference/ticker_events`。
+- 历史价格：用于 performance evaluation。
 
-验收标准：
+新闻 severity 规则很轻：
 
-- 能返回最近价格和历史价格序列。
-- 失败时返回可诊断错误，不吞异常。
+- 有 positive/negative sentiment insight 时为 `medium`。
+- 其他默认为 `low`。
 
-### M3: 实现新闻 / 公告 provider
+日历事件 severity 为 `medium`。
 
-获取目标 ticker 的新闻或公告。
+### SecEdgarProvider
 
-验收标准：
+读取 SEC submissions，并把 material forms 转成 `ResearchEvent`。
 
-- 能生成标准 `ResearchEvent`。
-- 同一条新闻重复抓取不会重复入库。
+当前 material forms：
 
-### M4: 实现事件分级
+```text
+8-K, 10-K, 10-Q, 20-F, 6-K
+```
 
-按规则给事件标记 `low`、`medium`、`high`、`critical`。
+severity：
 
-验收标准：
+- `8-K`: `high`
+- 其他 material forms: `medium`
 
-- 价格大幅异动可被标记为 high 或 critical。
-- 普通重复新闻只记录为 low 或被去重。
+SEC 访问必须配置 `SEC_USER_AGENT`。ticker 到 CIK 的映射来自 SEC company tickers JSON，并在 provider 实例内缓存。
 
-## 待确认
+### FinancialModelingPrepProvider
 
-- 第一版市场数据源选 Yahoo Finance、Polygon 还是 Alpha Vantage。
-- 第一版新闻 / 公告来源选哪个。
+可选 transcript provider。只有配置 `FMP_API_KEY` 时 CLI 才会注入它。
+
+输出：
+
+- `event_type = earnings_transcript`
+- `source = financial_modeling_prep`
+- `severity = medium`
+- `summary` 是 transcript/content 的前 500 个字符或 title fallback。
+
+## CompositeResearchEventProvider
+
+`CompositeResearchEventProvider.fetch_news()` 是 workflow 看到的统一事件入口。它按顺序合并：
+
+1. news provider
+2. filing provider
+3. earnings calendar provider
+4. transcript provider
+
+返回值按 `occurred_at` 倒序排序。
+
+命名上它实现的是 `NewsProvider` 协议，实际语义是“research event provider”。这是当前代码的兼容命名，新增代码应避免把它理解成只包含新闻。
+
+## 本地与测试 provider
+
+- `FakeMarketDataProvider`
+- `FakeNewsProvider`
+- `FakeLowSeverityNewsProvider`
+- `FakeHistoricalPriceProvider`
+- `CsvPriceProvider`
+- `JsonNewsProvider`
+
+这些 provider 支撑单元测试和 smoke 流程。它们必须保持与真实 provider 相同的 domain 输出，避免测试绕过业务校验。
+
+## HTTP 边界
+
+`HttpJsonClient` 是轻量 urllib 封装：
+
+- `get_json()`: 要求响应是 object。
+- `get_json_or_list()`: 允许 object 或 array。
+- `get_json_absolute()`: 访问完整 URL，例如 SEC ticker mapping。
+
+HTTP 错误被转成 `ValueError`，provider 会在必要时补充供应商语义错误。
+
+## 扩展规则
+
+- 新 provider 应实现 protocol，而不是修改 agent workflow。
+- provider 输出必须是 `MarketData`、`ResearchEvent` 或 `PricePoint`，不要返回供应商原始 JSON。
+- 稳定 `external_id` 很重要，因为 repository 依赖 `(source, external_id)` 去重。
+- severity 规则应简单、可测试；复杂影响判断留给 LLM impact analysis。
